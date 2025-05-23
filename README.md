@@ -21,3 +21,11 @@ GuardianTrack is an Android app that continuously tracks GPS location every 1 mi
 - Used Foreground Service to persist updates in the background
 - Confirmed background operation works with screen off or app killed
 - Validated Google Sheet receives data correctly
+
+### 📅 Day 3: Auto-Start on Boot
+
+- Created a BroadcastReceiver to listen for BOOT_COMPLETED event
+- Configured the receiver with the correct intent filter in AndroidManifest.xml
+- Implemented logic to restart the location tracking foreground service automatically after device reboot
+- Tested and verified service auto-starts on reboot and logs location updates
+- Ensured compatibility with Android 10+ implicit broadcast restrictions
