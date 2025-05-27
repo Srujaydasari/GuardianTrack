@@ -1,38 +1,147 @@
 package com.example.guardiantrack
 
 import android.Manifest
-import android.app.AlertDialog
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import com.example.guardiantrack.ui.theme.GuardianTrackTheme
+import androidx.activity.compose.rememberLauncherForActivityResult
 
 class MainActivity : ComponentActivity() {
+
+    private val NOTIFICATION_ID = 1001
+    private val CHANNEL_ID = "watchdog_channel"
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        createNotificationChannel()
+
         setContent {
-            GuardianTrackTheme {
+            Column {
+                GpsLogScreen()
                 PermissionHandler()
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+
+        val missingPermissions = getMissingPermissions(this)
+        val gpsEnabled = isGpsEnabled(this)
+
+        if (!gpsEnabled || missingPermissions.isNotEmpty()) {
+            showGpsOrPermissionNotification(this, gpsEnabled, missingPermissions)
+        } else {
+            cancelGpsDisabledNotification(this)
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channelName = "GuardianTrack Watchdog"
+            val importance = android.app.NotificationManager.IMPORTANCE_HIGH
+            val channel = android.app.NotificationChannel(CHANNEL_ID, channelName, importance).apply {
+                description = "Notifies when GPS or permissions are disabled"
+            }
+            val notificationManager = getSystemService(android.app.NotificationManager::class.java)
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun isGpsEnabled(context: Context): Boolean {
+        val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        return locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+    }
+
+    private fun getMissingPermissions(context: Context): List<String> {
+        val requiredPermissions = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.READ_CALL_LOG,
+            Manifest.permission.READ_SMS,
+            Manifest.permission.RECEIVE_SMS,
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requiredPermissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        return requiredPermissions.filter {
+            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun showGpsOrPermissionNotification(
+        context: Context,
+        gpsEnabled: Boolean,
+        missingPermissions: List<String>
+    ) {
+        val notificationManager =
+            context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+
+        val intent = if (!gpsEnabled) {
+            Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+        } else {
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.fromParts("package", context.packageName, null)
+            }
+        }
+
+        val pendingIntentFlags =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            else
+                PendingIntent.FLAG_UPDATE_CURRENT
+
+        val pendingIntent = PendingIntent.getActivity(context, 0, intent, pendingIntentFlags)
+
+        val title = if (!gpsEnabled) "GPS Disabled" else "Permissions Missing"
+        val content = if (!gpsEnabled) {
+            "Please enable GPS for location tracking."
+        } else {
+            "Missing permissions: ${
+                missingPermissions.joinToString(", ") {
+                    it.substringAfterLast('.')
+                }
+            }"
+        }
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle(title)
+            .setContentText(content)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+
+        notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun cancelGpsDisabledNotification(context: Context) {
+        val notificationManager =
+            context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        notificationManager.cancel(NOTIFICATION_ID)
     }
 }
 
@@ -40,177 +149,136 @@ class MainActivity : ComponentActivity() {
 fun PermissionHandler() {
     val context = LocalContext.current
 
-    val otherPermissions = remember {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_BACKGROUND_LOCATION,
-                Manifest.permission.READ_CALL_LOG,
-                Manifest.permission.READ_SMS
-            )
-        } else {
-            arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.READ_CALL_LOG,
-                Manifest.permission.READ_SMS
-            )
-        }
-    }
-
-    val notificationPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        Manifest.permission.POST_NOTIFICATIONS
-    } else null
-
-    var fgServiceLocationGranted by remember { mutableStateOf(false) }
-    var otherPermissionsGranted by remember { mutableStateOf(false) }
+    var locationPermissionsGranted by remember { mutableStateOf(false) }
+    var callLogPermissionsGranted by remember { mutableStateOf(false) }
+    var smsPermissionsGranted by remember { mutableStateOf(false) }
     var notificationPermissionGranted by remember { mutableStateOf(false) }
     var batteryOptimizationsIgnored by remember { mutableStateOf(false) }
-    var showPermissionRationale by remember { mutableStateOf(false) }
     var showBatteryDialog by remember { mutableStateOf(false) }
-    var permissionRequestInProgress by remember { mutableStateOf(false) }
     var serviceStarted by remember { mutableStateOf(false) }
 
-    // Launcher for FOREGROUND_SERVICE_LOCATION permission (API 34+)
-    val fgServiceLocationLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        fgServiceLocationGranted = granted
-        if (!granted) {
-            Toast.makeText(
-                context,
-                "Foreground Service Location permission denied",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-    }
+    val locationPermissions = arrayOf(
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION
+    )
+    val callLogPermissions = arrayOf(Manifest.permission.READ_CALL_LOG)
+    val smsPermissions = arrayOf(
+        Manifest.permission.READ_SMS,
+        Manifest.permission.RECEIVE_SMS
+    )
+    val notificationPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+        Manifest.permission.POST_NOTIFICATIONS else null
 
-    // Launcher for multiple other permissions
-    val otherPermissionsLauncher = rememberLauncherForActivityResult(
+    val locationLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { results ->
-        val denied = results.filterValues { !it }.keys
-        otherPermissionsGranted = denied.isEmpty()
-
-        if (denied.isNotEmpty()) {
-            Toast.makeText(
-                context,
-                "Permissions denied: ${denied.joinToString()}",
-                Toast.LENGTH_LONG
-            ).show()
-            showPermissionRationale = true
-        } else {
-            showPermissionRationale = false
-        }
-        permissionRequestInProgress = false
+    ) {
+        locationPermissionsGranted = it.values.all { granted -> granted }
     }
 
-    // Launcher for notification permission (API 33+)
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+    val callLogLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        callLogPermissionsGranted = it.values.all { granted -> granted }
+    }
+
+    val smsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        smsPermissionsGranted = it.values.all { granted -> granted }
+    }
+
+    val notificationLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         notificationPermissionGranted = granted
-        if (!granted) {
-            Toast.makeText(context, "Notification permission denied", Toast.LENGTH_LONG).show()
-        }
     }
 
-    // Launcher for battery optimization ignore request
     val batteryOptLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
         batteryOptimizationsIgnored = isIgnoringBatteryOptimizations(context)
-        if (batteryOptimizationsIgnored) {
-            Toast.makeText(context, "Battery optimizations ignored!", Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(context, "Battery optimization not ignored.", Toast.LENGTH_SHORT).show()
-        }
-        showBatteryDialog = false
     }
 
+    // Check permissions on first launch
     LaunchedEffect(Unit) {
-        fgServiceLocationGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.FOREGROUND_SERVICE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-        } else {
-            true
-        }
-
-        otherPermissionsGranted = otherPermissions.all {
+        locationPermissionsGranted = locationPermissions.all {
             ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
         }
-
-        notificationPermissionGranted = if (notificationPermission != null) {
-            ContextCompat.checkSelfPermission(context, notificationPermission) == PackageManager.PERMISSION_GRANTED
-        } else {
-            true
+        callLogPermissionsGranted = callLogPermissions.all {
+            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
         }
+        smsPermissionsGranted = smsPermissions.all {
+            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+        }
+        notificationPermissionGranted = notificationPermission?.let {
+            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+        } ?: true
 
         batteryOptimizationsIgnored = isIgnoringBatteryOptimizations(context)
 
-        when {
-            !fgServiceLocationGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> {
-                fgServiceLocationLauncher.launch(Manifest.permission.FOREGROUND_SERVICE_LOCATION)
-            }
-
-            !otherPermissionsGranted && !permissionRequestInProgress -> {
-                permissionRequestInProgress = true
-                otherPermissionsLauncher.launch(otherPermissions)
-            }
-
-            !notificationPermissionGranted && notificationPermission != null -> {
-                notificationPermissionLauncher.launch(notificationPermission)
-            }
-
-            !batteryOptimizationsIgnored -> {
-                showBatteryDialog = true
-            }
-        }
-    }
-
-    if (showPermissionRationale) {
-        showPermissionRationaleDialog(context) {
-            showPermissionRationale = false
-            permissionRequestInProgress = true
-            otherPermissionsLauncher.launch(otherPermissions)
-        }
+        if (!locationPermissionsGranted) locationLauncher.launch(locationPermissions)
+        else if (!callLogPermissionsGranted) callLogLauncher.launch(callLogPermissions)
+        else if (!smsPermissionsGranted) smsLauncher.launch(smsPermissions)
+        else if (!notificationPermissionGranted && notificationPermission != null)
+            notificationLauncher.launch(notificationPermission)
+        else if (!batteryOptimizationsIgnored) showBatteryDialog = true
     }
 
     if (showBatteryDialog) {
-        showBatteryOptimizationDialog(context) {
-            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                data = Uri.parse("package:${context.packageName}")
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Ignore Battery Optimizations") },
+            text = {
+                Text("GuardianTrack requires ignoring battery optimizations for accurate background tracking.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:${context.packageName}")
+                    }
+                    batteryOptLauncher.launch(intent)
+                    showBatteryDialog = false
+                }) {
+                    Text("Allow")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBatteryDialog = false }) {
+                    Text("Cancel")
+                }
             }
-            batteryOptLauncher.launch(intent)
-        }
+        )
     }
 
-    LaunchedEffect(fgServiceLocationGranted, otherPermissionsGranted, notificationPermissionGranted, batteryOptimizationsIgnored) {
+    LaunchedEffect(
+        locationPermissionsGranted,
+        callLogPermissionsGranted,
+        smsPermissionsGranted,
+        notificationPermissionGranted,
+        batteryOptimizationsIgnored
+    ) {
         if (
-            fgServiceLocationGranted
-            && otherPermissionsGranted
-            && notificationPermissionGranted
-            && batteryOptimizationsIgnored
-            && !serviceStarted
+            locationPermissionsGranted &&
+            callLogPermissionsGranted &&
+            smsPermissionsGranted &&
+            notificationPermissionGranted &&
+            batteryOptimizationsIgnored &&
+            !serviceStarted
         ) {
+            Toast.makeText(context, "All permissions granted. Starting tracking.", Toast.LENGTH_SHORT).show()
             startLocationService(context)
             serviceStarted = true
-            Toast.makeText(context, "All permissions granted and tracking started.", Toast.LENGTH_SHORT).show()
         }
     }
 
     Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
         Text(
             text = when {
-                !fgServiceLocationGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE ->
-                    "Requesting foreground service location permission..."
-                !otherPermissionsGranted ->
-                    "Requesting other permissions..."
-                !notificationPermissionGranted && notificationPermission != null ->
-                    "Requesting notification permission..."
-                !batteryOptimizationsIgnored ->
-                    "Requesting to ignore battery optimizations..."
+                !locationPermissionsGranted -> "Requesting location permissions..."
+                !callLogPermissionsGranted -> "Requesting call log permissions..."
+                !smsPermissionsGranted -> "Requesting SMS permissions..."
+                !notificationPermissionGranted && notificationPermission != null -> "Requesting notification permission..."
+                !batteryOptimizationsIgnored -> "Requesting battery optimization exemption..."
                 else -> "All permissions granted and tracking started."
             },
             modifier = Modifier.padding(padding)
@@ -218,42 +286,16 @@ fun PermissionHandler() {
     }
 }
 
-fun showPermissionRationaleDialog(context: Context, onAllow: () -> Unit) {
-    AlertDialog.Builder(context)
-        .setTitle("Permissions Required")
-        .setMessage(
-            "GuardianTrack needs access to location, call logs, SMS, and notifications " +
-                    "to function properly in the background. Please allow the permissions."
-        )
-        .setCancelable(false)
-        .setPositiveButton("Allow") { _, _ -> onAllow() }
-        .setNegativeButton("Cancel") { dialog, _ -> dialog.dismiss() }
-        .show()
-}
-
-fun showBatteryOptimizationDialog(context: Context, onAllow: () -> Unit) {
-    AlertDialog.Builder(context)
-        .setTitle("Ignore Battery Optimizations")
-        .setMessage(
-            "To ensure GuardianTrack runs reliably in the background, " +
-                    "please allow it to ignore battery optimizations."
-        )
-        .setCancelable(false)
-        .setPositiveButton("Allow") { _, _ -> onAllow() }
-        .setNegativeButton("Cancel") { dialog, _ -> dialog.dismiss() }
-        .show()
-}
-
 fun isIgnoringBatteryOptimizations(context: Context): Boolean {
-    val powerManager = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+    val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     return powerManager.isIgnoringBatteryOptimizations(context.packageName)
 }
 
 fun startLocationService(context: Context) {
-    val serviceIntent = Intent(context, LocationService::class.java)
+    val intent = Intent(context, LocationService::class.java)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        ContextCompat.startForegroundService(context, serviceIntent)
+        context.startForegroundService(intent)
     } else {
-        context.startService(serviceIntent)
+        context.startService(intent)
     }
 }
